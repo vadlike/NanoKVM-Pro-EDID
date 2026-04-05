@@ -16,6 +16,17 @@ CLI for fast EDID/profile switching on NanoKVM Pro from terminal.
 sudo bash install.sh
 ```
 
+## Install Via Curl
+```bash
+curl -fsSL https://raw.githubusercontent.com/vadlike/NanoKVM-Pro-EDID/main/install.sh | sudo bash
+```
+
+Install from a specific tag:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/vadlike/NanoKVM-Pro-EDID/main/install.sh | sudo NANOKVM_EDID_REF=v0.1.0 bash
+```
+
 ## Quick Usage
 ```bash
 nanokvm-edid list
