@@ -7,7 +7,20 @@ DATA_DIR="${DATA_DIR:-/opt/nanokvm-edid/profiles}"
 NANOKVM_EDID_REPO="${NANOKVM_EDID_REPO:-vadlike/NanoKVM-Pro-EDID}"
 NANOKVM_EDID_REF="${NANOKVM_EDID_REF:-main}"
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_SOURCE="${BASH_SOURCE[0]:-$0}"
+if [[ -n "${SCRIPT_SOURCE:-}" && -f "$SCRIPT_SOURCE" ]]; then
+  SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_SOURCE")" && pwd)"
+else
+  SCRIPT_DIR="$(pwd)"
+fi
+
+TMP_DIR=""
+cleanup() {
+  if [[ -n "${TMP_DIR:-}" && -d "$TMP_DIR" ]]; then
+    rm -rf "$TMP_DIR"
+  fi
+}
+trap cleanup EXIT
 
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   echo "Run as root: sudo bash install.sh" >&2
@@ -23,16 +36,14 @@ require_cmd() {
 
 fetch_from_github() {
   local raw_base="https://raw.githubusercontent.com/$NANOKVM_EDID_REPO/$NANOKVM_EDID_REF"
-  local tmp_dir
-  tmp_dir="$(mktemp -d)"
-  trap 'rm -rf "$tmp_dir"' EXIT
+  TMP_DIR="$(mktemp -d)"
 
   require_cmd curl
-  curl -fsSL "$raw_base/bin/nanokvm-edid" -o "$tmp_dir/nanokvm-edid"
-  curl -fsSL "$raw_base/profiles/e18-2560x1600.bin" -o "$tmp_dir/e18-2560x1600.bin"
+  curl -fsSL "$raw_base/bin/nanokvm-edid" -o "$TMP_DIR/nanokvm-edid"
+  curl -fsSL "$raw_base/profiles/e18-2560x1600.bin" -o "$TMP_DIR/e18-2560x1600.bin"
 
-  SRC_BIN="$tmp_dir/nanokvm-edid"
-  SRC_PROFILE="$tmp_dir/e18-2560x1600.bin"
+  SRC_BIN="$TMP_DIR/nanokvm-edid"
+  SRC_PROFILE="$TMP_DIR/e18-2560x1600.bin"
   echo "Source: github $NANOKVM_EDID_REPO@$NANOKVM_EDID_REF"
 }
 
