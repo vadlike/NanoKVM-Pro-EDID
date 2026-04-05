@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROC_BASE="/proc/lt6911_info"
+EDID_NODE="$PROC_BASE/edid"
+WIDTH_NODE="$PROC_BASE/width"
+HEIGHT_NODE="$PROC_BASE/height"
+FPS_NODE="$PROC_BASE/fps"
+RX_NODE="$PROC_BASE/hdmi_rx_status"
+HDMI_POWER_NODE="$PROC_BASE/hdmi_power"
+BUILTIN_DIR="/kvmcomm/edid"
+CUSTOM_DIR="/opt/nanokvm-edid/profiles"
+BACKUP_DIR="/root"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  nanokvm-edid list
+  nanokvm-edid status
+  nanokvm-edid apply <preset|/path/to/file.bin> [--no-retrain]
+  nanokvm-edid retrain
+  nanokvm-edid restore
+
+Presets:
+  e18         -> /kvmcomm/edid/E18-4K30FPS.bin
+  e48         -> /kvmcomm/edid/E48-4K39FPS.bin
+  e54         -> /kvmcomm/edid/E54-1080P60FPS.bin
+  e56         -> /kvmcomm/edid/E56-2K60FPS.bin
+  e58         -> /kvmcomm/edid/E58-4K16-10.bin
+  e63         -> /kvmcomm/edid/E63-Ultrawide.bin
+  2560x1600   -> /opt/nanokvm-edid/profiles/e18-2560x1600.bin
+EOF
+}
+
+require_root() {
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    echo "Run as root." >&2
+    exit 1
+  fi
+}
+
+require_nodes() {
+  for node in "$EDID_NODE" "$HDMI_POWER_NODE"; do
+    if [[ ! -e "$node" ]]; then
+      echo "Node not found: $node" >&2
+      exit 1
+    fi
+  done
+}
+
+preset_to_file() {
+  case "${1,,}" in
+    e18) echo "$BUILTIN_DIR/E18-4K30FPS.bin" ;;
+    e48) echo "$BUILTIN_DIR/E48-4K39FPS.bin" ;;
+    e54) echo "$BUILTIN_DIR/E54-1080P60FPS.bin" ;;
+    e56) echo "$BUILTIN_DIR/E56-2K60FPS.bin" ;;
+    e58) echo "$BUILTIN_DIR/E58-4K16-10.bin" ;;
+    e63) echo "$BUILTIN_DIR/E63-Ultrawide.bin" ;;
+    2560x1600) echo "$CUSTOM_DIR/e18-2560x1600.bin" ;;
+    *) echo "" ;;
+  esac
+}
+
+print_status() {
+  local w h f r
+  w="$(cat "$WIDTH_NODE" 2>/dev/null || echo "?")"
+  h="$(cat "$HEIGHT_NODE" 2>/dev/null || echo "?")"
+  f="$(cat "$FPS_NODE" 2>/dev/null || echo "?")"
+  r="$(cat "$RX_NODE" 2>/dev/null || echo "?")"
+  echo "Width:  $w"
+  echo "Height: $h"
+  echo "FPS:    $f"
+  echo "RX:     $r"
+}
+
+list_presets() {
+  cat <<EOF
+e18        $BUILTIN_DIR/E18-4K30FPS.bin
+e48        $BUILTIN_DIR/E48-4K39FPS.bin
+e54        $BUILTIN_DIR/E54-1080P60FPS.bin
+e56        $BUILTIN_DIR/E56-2K60FPS.bin
+e58        $BUILTIN_DIR/E58-4K16-10.bin
+e63        $BUILTIN_DIR/E63-Ultrawide.bin
+2560x1600  $CUSTOM_DIR/e18-2560x1600.bin
+EOF
+}
+
+retrain() {
+  echo off > "$HDMI_POWER_NODE"
+  sleep 2
+  echo on > "$HDMI_POWER_NODE"
+  sleep 3
+}
+
+validate_edid() {
+  local file="$1"
+  if [[ ! -f "$file" ]]; then
+    echo "EDID file not found: $file" >&2
+    exit 1
+  fi
+  local size
+  size="$(wc -c < "$file")"
+  if [[ "$size" -ne 256 ]]; then
+    echo "EDID must be exactly 256 bytes, got: $size" >&2
+    exit 1
+  fi
+}
+
+apply_file() {
+  local file="$1"
+  local do_retrain="${2:-yes}"
+  validate_edid "$file"
+
+  local ts backup
+  ts="$(date +%Y%m%d-%H%M%S)"
+  backup="$BACKUP_DIR/edid-backup-$ts.bin"
+  cat "$EDID_NODE" > "$backup" || true
+  echo "Backup saved: $backup"
+
+  cat "$file" > "$EDID_NODE"
+  echo "Applied: $file"
+
+  if [[ "$do_retrain" == "yes" ]]; then
+    retrain
+  fi
+  print_status
+}
+
+main() {
+  local cmd="${1:-}"
+  cmd="${cmd%$'\r'}"
+  if [[ -z "$cmd" || "$cmd" == "-h" || "$cmd" == "--help" ]]; then
+    usage
+    exit 0
+  fi
+
+  require_root
+  require_nodes
+
+  case "$cmd" in
+    list)
+      list_presets
+      ;;
+    status)
+      print_status
+      ;;
+    retrain)
+      retrain
+      print_status
+      ;;
+    restore)
+      apply_file "$BUILTIN_DIR/E56-2K60FPS.bin" "yes"
+      ;;
+    apply)
+      local arg="${2:-}"
+      arg="${arg%$'\r'}"
+      local retrain_flag="yes"
+      if [[ -z "$arg" ]]; then
+        echo "Missing preset or file path." >&2
+        usage
+        exit 1
+      fi
+      if [[ "${3:-}" == "--no-retrain" || "${2:-}" == "--no-retrain" ]]; then
+        retrain_flag="no"
+      fi
+      local file
+      file="$(preset_to_file "$arg")"
+      if [[ -z "$file" ]]; then
+        file="$arg"
+      fi
+      apply_file "$file" "$retrain_flag"
+      ;;
+    *)
+      echo "Unknown command: $cmd" >&2
+      usage
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"
