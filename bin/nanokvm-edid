@@ -1,0 +1,669 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROC_BASE="/proc/lt6911_info"
+EDID_NODE="$PROC_BASE/edid"
+WIDTH_NODE="$PROC_BASE/width"
+HEIGHT_NODE="$PROC_BASE/height"
+FPS_NODE="$PROC_BASE/fps"
+RX_NODE="$PROC_BASE/hdmi_rx_status"
+HDMI_POWER_NODE="$PROC_BASE/hdmi_power"
+BUILTIN_DIR="${NANOKVM_EDID_BUILTIN_DIR:-/kvmcomm/edid}"
+CUSTOM_DIR="${NANOKVM_EDID_CUSTOM_DIR:-/opt/nanokvm-edid/profiles}"
+BACKUP_DIR="/root"
+MENU_EXIT_AFTER_ACTION=0
+C_RESET=""
+C_BOLD=""
+C_DIM=""
+C_RED=""
+C_GREEN=""
+C_YELLOW=""
+C_BLUE=""
+C_MAGENTA=""
+C_CYAN=""
+
+setup_colors() {
+  if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+    C_RESET=$'\033[0m'
+    C_BOLD=$'\033[1m'
+    C_DIM=$'\033[2m'
+    C_RED=$'\033[31m'
+    C_GREEN=$'\033[32m'
+    C_YELLOW=$'\033[33m'
+    C_BLUE=$'\033[34m'
+    C_MAGENTA=$'\033[35m'
+    C_CYAN=$'\033[36m'
+  fi
+}
+
+log_info() {
+  printf "%b\n" "${C_CYAN}$*${C_RESET}"
+}
+
+log_ok() {
+  printf "%b\n" "${C_GREEN}$*${C_RESET}"
+}
+
+log_warn() {
+  printf "%b\n" "${C_YELLOW}$*${C_RESET}" >&2
+}
+
+log_err() {
+  printf "%b\n" "${C_RED}$*${C_RESET}" >&2
+}
+
+usage() {
+  cat <<'EOF'
+Usage:
+  nanokvm-edid list
+  nanokvm-edid status
+  nanokvm-edid menu
+  nanokvm-edid build
+  nanokvm-edid about
+  nanokvm-edid apply <preset|/path/to/file.bin> [--no-retrain]
+  nanokvm-edid retrain
+  nanokvm-edid restore
+
+Presets:
+  e18         -> /kvmcomm/edid/E18-4K30FPS.bin
+  e48         -> /kvmcomm/edid/E48-4K39FPS.bin
+  e54         -> /kvmcomm/edid/E54-1080P60FPS.bin
+  e56         -> /kvmcomm/edid/E56-2K60FPS.bin
+  e58         -> /kvmcomm/edid/E58-4K16-10.bin
+  e63         -> /kvmcomm/edid/E63-Ultrawide.bin
+  2560x1600   -> /opt/nanokvm-edid/profiles/e18-2560x1600.bin
+EOF
+}
+
+print_about() {
+  printf "%b\n" "${C_BOLD}${C_MAGENTA}Author${C_RESET}"
+  echo "  vadlike"
+  echo "  https://github.com/vadlike"
+  echo "  https://github.com/vadlike/NanoKVM-Pro-EDID/tree/main"
+}
+
+require_root() {
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    log_err "Run as root."
+    exit 1
+  fi
+}
+
+require_nodes() {
+  for node in "$EDID_NODE" "$HDMI_POWER_NODE"; do
+    if [[ ! -e "$node" ]]; then
+      log_err "Node not found: $node"
+      exit 1
+    fi
+  done
+}
+
+preset_to_file() {
+  case "${1,,}" in
+    e18) echo "$BUILTIN_DIR/E18-4K30FPS.bin" ;;
+    e48) echo "$BUILTIN_DIR/E48-4K39FPS.bin" ;;
+    e54) echo "$BUILTIN_DIR/E54-1080P60FPS.bin" ;;
+    e56) echo "$BUILTIN_DIR/E56-2K60FPS.bin" ;;
+    e58) echo "$BUILTIN_DIR/E58-4K16-10.bin" ;;
+    e63) echo "$BUILTIN_DIR/E63-Ultrawide.bin" ;;
+    2560x1600) echo "$CUSTOM_DIR/e18-2560x1600.bin" ;;
+    *) echo "" ;;
+  esac
+}
+
+print_status() {
+  local w h f r
+  w="$(cat "$WIDTH_NODE" 2>/dev/null || echo "?")"
+  h="$(cat "$HEIGHT_NODE" 2>/dev/null || echo "?")"
+  f="$(cat "$FPS_NODE" 2>/dev/null || echo "?")"
+  r="$(cat "$RX_NODE" 2>/dev/null || echo "?")"
+  printf "%bWidth:%b  %b%s%b\n" "$C_BLUE" "$C_RESET" "$C_GREEN" "$w" "$C_RESET"
+  printf "%bHeight:%b %b%s%b\n" "$C_BLUE" "$C_RESET" "$C_GREEN" "$h" "$C_RESET"
+  printf "%bFPS:%b    %b%s%b\n" "$C_BLUE" "$C_RESET" "$C_GREEN" "$f" "$C_RESET"
+  printf "%bRX:%b     %b%s%b\n" "$C_BLUE" "$C_RESET" "$C_GREEN" "$r" "$C_RESET"
+}
+
+list_presets() {
+  cat <<EOF
+e18        $BUILTIN_DIR/E18-4K30FPS.bin
+e48        $BUILTIN_DIR/E48-4K39FPS.bin
+e54        $BUILTIN_DIR/E54-1080P60FPS.bin
+e56        $BUILTIN_DIR/E56-2K60FPS.bin
+e58        $BUILTIN_DIR/E58-4K16-10.bin
+e63        $BUILTIN_DIR/E63-Ultrawide.bin
+2560x1600  $CUSTOM_DIR/e18-2560x1600.bin
+EOF
+}
+
+retrain() {
+  echo off > "$HDMI_POWER_NODE"
+  sleep 2
+  echo on > "$HDMI_POWER_NODE"
+  sleep 3
+}
+
+is_uint() {
+  [[ "$1" =~ ^[0-9]+$ ]]
+}
+
+prompt_with_default() {
+  local __var="$1"
+  local prompt="$2"
+  local default="$3"
+  local input=""
+  read -r -p "$prompt [$default]: " input
+  input="${input:-$default}"
+  printf -v "$__var" '%s' "$input"
+}
+
+build_custom_profile() {
+  local width height hz filename base out_file ans
+  local hblank=160
+  local vblank=200
+  local hsync_offset=48
+  local hsync_width=32
+  local vsync_offset=3
+  local vsync_width=6
+  local htotal vtotal pixel_clock
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    log_err "python3 is required for custom builder."
+    return 1
+  fi
+
+  base="$BUILTIN_DIR/E18-4K30FPS.bin"
+  if [[ ! -f "$base" ]]; then
+    log_err "Base EDID not found: $base"
+    return 1
+  fi
+
+  log_info "Custom EDID builder wizard"
+  printf "%b\n" "${C_DIM}Press Enter to accept defaults.${C_RESET}"
+  echo
+
+  prompt_with_default width "Width" "2560"
+  if ! is_uint "$width" || ((width < 640 || width > 4095)); then
+    log_err "Width must be 640..4095"
+    return 1
+  fi
+
+  prompt_with_default height "Height" "1600"
+  if ! is_uint "$height" || ((height < 480 || height > 4095)); then
+    log_err "Height must be 480..4095"
+    return 1
+  fi
+
+  prompt_with_default hz "Refresh Hz" "120"
+  if ! is_uint "$hz" || ((hz < 24 || hz > 240)); then
+    log_err "Refresh must be 24..240"
+    return 1
+  fi
+
+  prompt_with_default filename "Profile file name" "custom-${width}x${height}-${hz}.bin"
+  filename="${filename// /_}"
+  filename="$(echo "$filename" | tr -cd 'A-Za-z0-9._-')"
+  if [[ -z "$filename" ]]; then
+    log_err "Profile file name is empty after sanitizing."
+    return 1
+  fi
+  if [[ "$filename" != *.bin ]]; then
+    filename="${filename}.bin"
+  fi
+
+  htotal=$((width + hblank))
+  vtotal=$((height + vblank))
+  pixel_clock=$(((htotal * vtotal * hz + 5000) / 10000))
+  if ((pixel_clock < 1 || pixel_clock > 65535)); then
+    log_err "Pixel clock out of EDID range (1..65535 in 10kHz units): $pixel_clock"
+    return 1
+  fi
+
+  out_file="$CUSTOM_DIR/$filename"
+
+  echo
+  printf "%b\n" "${C_BOLD}${C_MAGENTA}Summary:${C_RESET}"
+  printf "  %bResolution:%b %s\n" "$C_BLUE" "$C_RESET" "${width}x${height}"
+  printf "  %bRefresh:%b    %s Hz\n" "$C_BLUE" "$C_RESET" "$hz"
+  printf "  %bPixelClock:%b %s x 10kHz\n" "$C_BLUE" "$C_RESET" "$pixel_clock"
+  printf "  %bOutput:%b     %s\n" "$C_BLUE" "$C_RESET" "$out_file"
+  echo
+  read -r -p "Build profile now? [Y/n]: " ans
+  case "${ans:-}" in
+    n|N|no|NO)
+      log_warn "Build canceled."
+      return 0
+      ;;
+  esac
+
+  install -d "$CUSTOM_DIR"
+  python3 - "$base" "$out_file" "$width" "$height" "$hz" \
+    "$hblank" "$vblank" "$hsync_offset" "$hsync_width" "$vsync_offset" "$vsync_width" "$pixel_clock" <<'PY'
+import sys
+from pathlib import Path
+
+base, out = Path(sys.argv[1]), Path(sys.argv[2])
+width = int(sys.argv[3]); height = int(sys.argv[4]); hz = int(sys.argv[5])
+hblank = int(sys.argv[6]); vblank = int(sys.argv[7])
+hsync_offset = int(sys.argv[8]); hsync_width = int(sys.argv[9])
+vsync_offset = int(sys.argv[10]); vsync_width = int(sys.argv[11])
+pixel_clock = int(sys.argv[12])
+
+data = bytearray(base.read_bytes())
+if len(data) != 256:
+    raise SystemExit(f"Expected 256-byte EDID, got {len(data)} bytes: {base}")
+
+for name, value, limit in (
+    ("width", width, 4095),
+    ("height", height, 4095),
+    ("hblank", hblank, 4095),
+    ("vblank", vblank, 4095),
+    ("hsync_offset", hsync_offset, 1023),
+    ("hsync_width", hsync_width, 1023),
+    ("vsync_offset", vsync_offset, 63),
+    ("vsync_width", vsync_width, 63),
+):
+    if not (0 <= value <= limit):
+        raise SystemExit(f"{name} out of range: {value} (max {limit})")
+
+dtd = [0] * 18
+dtd[0] = pixel_clock & 0xFF
+dtd[1] = (pixel_clock >> 8) & 0xFF
+dtd[2] = width & 0xFF
+dtd[3] = hblank & 0xFF
+dtd[4] = ((width >> 8) & 0xF) << 4 | ((hblank >> 8) & 0xF)
+dtd[5] = height & 0xFF
+dtd[6] = vblank & 0xFF
+dtd[7] = ((height >> 8) & 0xF) << 4 | ((vblank >> 8) & 0xF)
+dtd[8] = hsync_offset & 0xFF
+dtd[9] = hsync_width & 0xFF
+dtd[10] = ((vsync_offset & 0xF) << 4) | (vsync_width & 0xF)
+dtd[11] = (((hsync_offset >> 8) & 0x3) << 6) | (((hsync_width >> 8) & 0x3) << 4) \
+        | (((vsync_offset >> 4) & 0x3) << 2) | ((vsync_width >> 4) & 0x3)
+
+old_dtd = data[54:72]
+dtd[12] = old_dtd[12]
+dtd[13] = old_dtd[13]
+dtd[14] = old_dtd[14]
+dtd[15] = 0
+dtd[16] = 0
+dtd[17] = 0x1A
+data[54:72] = bytes(dtd)
+
+seed = (width * 1315423911 + height * 2654435761 + hz * 2246822519) & 0xFFFFFFFF
+data[10] = (seed >> 8) & 0xFF
+data[11] = seed & 0xFF
+data[12] = width & 0xFF
+data[13] = height & 0xFF
+data[14] = hz & 0xFF
+data[15] = (seed >> 16) & 0xFF
+
+data[127] = (-sum(data[:127])) & 0xFF
+data[255] = (-sum(data[128:255])) & 0xFF
+
+out.parent.mkdir(parents=True, exist_ok=True)
+out.write_bytes(data)
+print(f"Wrote {out} ({len(data)} bytes)")
+PY
+
+  log_ok "Profile created: $out_file"
+  echo
+  read -r -p "Apply now? [Y/n]: " ans
+  case "${ans:-}" in
+    n|N|no|NO)
+      log_warn "Skipped apply."
+      ;;
+    *)
+      apply_file "$out_file" "yes"
+      ;;
+  esac
+}
+
+uninstall_tool() {
+  local bin_path profile_path parent_dir ans
+  bin_path="$(command -v nanokvm-edid 2>/dev/null || echo "/usr/local/bin/nanokvm-edid")"
+  profile_path="$CUSTOM_DIR/e18-2560x1600.bin"
+  parent_dir="$(dirname "$CUSTOM_DIR")"
+
+  printf "%b\n" "${C_BOLD}${C_MAGENTA}This will remove:${C_RESET}"
+  printf "  %s\n" "$bin_path"
+  printf "  %s\n" "$profile_path"
+  echo
+  read -r -p "Continue uninstall? [y/N]: " ans
+  case "${ans:-}" in
+    y|Y|yes|YES)
+      if [[ -f "$profile_path" ]]; then
+        rm -f "$profile_path"
+        log_ok "Removed: $profile_path"
+      else
+        log_warn "Not found: $profile_path"
+      fi
+
+      if [[ -d "$CUSTOM_DIR" ]] && [[ -z "$(ls -A "$CUSTOM_DIR" 2>/dev/null)" ]]; then
+        rmdir "$CUSTOM_DIR" || true
+      fi
+      if [[ -d "$parent_dir" ]] && [[ -z "$(ls -A "$parent_dir" 2>/dev/null)" ]]; then
+        rmdir "$parent_dir" || true
+      fi
+
+      if [[ -f "$bin_path" ]]; then
+        rm -f "$bin_path"
+        log_ok "Removed: $bin_path"
+      else
+        log_warn "Not found: $bin_path"
+      fi
+      log_ok "Uninstall completed."
+      MENU_EXIT_AFTER_ACTION=1
+      ;;
+    *)
+      log_warn "Uninstall canceled."
+      ;;
+  esac
+}
+
+pause_prompt() {
+  echo
+  printf "%b" "${C_DIM}Press Enter to continue...${C_RESET}"
+  read -r _
+}
+
+draw_menu() {
+  local selected="$1"
+  shift
+  local -a items=("$@")
+  local i
+
+  clear
+  printf "%b\n" "${C_BOLD}${C_CYAN}nanokvm-edid interactive menu${C_RESET}"
+  printf "%b\n" "${C_DIM}Use Up/Down arrows, Enter to run, Q to exit.${C_RESET}"
+  echo
+  print_status
+  echo
+
+  for i in "${!items[@]}"; do
+    if [[ "$i" -eq "$selected" ]]; then
+      printf "%b > %s%b\n" "$C_GREEN" "${items[$i]}" "$C_RESET"
+    else
+      printf "   %s\n" "${items[$i]}"
+    fi
+  done
+}
+
+run_menu_action() {
+  local idx="$1"
+  local rc=0
+
+  clear
+  MENU_EXIT_AFTER_ACTION=0
+  set +e
+  case "$idx" in
+    0) apply_file "$(preset_to_file "2560x1600")" "yes" ;;
+    1) apply_file "$(preset_to_file "e18")" "yes" ;;
+    2) apply_file "$(preset_to_file "e48")" "yes" ;;
+    3) apply_file "$(preset_to_file "e54")" "yes" ;;
+    4) apply_file "$(preset_to_file "e56")" "yes" ;;
+    5) apply_file "$(preset_to_file "e63")" "yes" ;;
+    6) print_status ;;
+    7) retrain; print_status ;;
+    8) apply_file "$BUILTIN_DIR/E56-2K60FPS.bin" "yes" ;;
+    9) list_presets ;;
+    10) build_custom_profile ;;
+    11) print_about ;;
+    12) uninstall_tool ;;
+    13) MENU_EXIT_AFTER_ACTION=1 ;;
+  esac
+  rc=$?
+  set -e
+
+  if [[ "$MENU_EXIT_AFTER_ACTION" -eq 1 ]]; then
+    return 1
+  fi
+
+  if [[ "$rc" -ne 0 ]]; then
+    echo
+    log_err "Command failed with exit code: $rc"
+  fi
+  pause_prompt
+  return 0
+}
+
+menu_loop() {
+  local -a items=(
+    "Apply 2560x1600 (custom)"
+    "Apply e18 (4K30 preset)"
+    "Apply e48 (4K39 preset)"
+    "Apply e54 (1080p60 preset)"
+    "Apply e56 (2K60 preset)"
+    "Apply e63 (Ultrawide preset)"
+    "Show status"
+    "Retrain HDMI"
+    "Restore default (e56)"
+    "List presets"
+    "Build custom profile (wizard)"
+    "About author"
+    "Uninstall"
+    "Exit"
+  )
+  local selected=0
+  local key rest
+
+  while true; do
+    draw_menu "$selected" "${items[@]}"
+    IFS= read -rsn1 key || continue
+
+    if [[ "$key" == $'\x1b' ]]; then
+      rest=""
+      read -rsn2 -t 0.2 rest || true
+      key+="${rest}"
+    fi
+
+    case "$key" in
+      $'\x1b[A')
+        selected=$(( (selected - 1 + ${#items[@]}) % ${#items[@]} ))
+        ;;
+      $'\x1b[B')
+        selected=$(( (selected + 1) % ${#items[@]} ))
+        ;;
+      $'\n'|$'\r'|'')
+        if ! run_menu_action "$selected"; then
+          break
+        fi
+        ;;
+      k|K|w|W)
+        selected=$(( (selected - 1 + ${#items[@]}) % ${#items[@]} ))
+        ;;
+      j|J|s|S)
+        selected=$(( (selected + 1) % ${#items[@]} ))
+        ;;
+      q|Q)
+        break
+        ;;
+    esac
+  done
+}
+
+validate_edid() {
+  local file="$1"
+  if [[ ! -f "$file" ]]; then
+    log_err "EDID file not found: $file"
+    exit 1
+  fi
+  local size
+  size="$(wc -c < "$file")"
+  if [[ "$size" -ne 256 ]]; then
+    log_err "EDID must be exactly 256 bytes, got: $size"
+    exit 1
+  fi
+}
+
+verify_edid() {
+  local file="$1"
+  local rb
+  rb="$(mktemp)"
+  if ! cat "$EDID_NODE" > "$rb" 2>/dev/null; then
+    rm -f "$rb"
+    return 2
+  fi
+
+  if command -v cmp >/dev/null 2>&1; then
+    if ! cmp -n 256 -s "$file" "$rb"; then
+      rm -f "$rb"
+      return 3
+    fi
+  else
+    rm -f "$rb"
+    return 2
+  fi
+
+  rm -f "$rb"
+  return 0
+}
+
+write_edid_once() {
+  local file="$1"
+  if ! cat "$file" > "$EDID_NODE" 2>/dev/null; then
+    return 1
+  fi
+  return 0
+}
+
+write_edid_with_retries() {
+  local file="$1"
+  local attempt
+  local max_attempts=4
+
+  for ((attempt=1; attempt<=max_attempts; attempt++)); do
+    if write_edid_once "$file"; then
+      return 0
+    fi
+
+    if [[ "$attempt" -lt "$max_attempts" ]]; then
+      if [[ "$attempt" -eq 1 ]]; then
+        log_warn "Write failed, retrying with HDMI power cycle..."
+      else
+        log_warn "Write retry $attempt/$max_attempts failed, trying again..."
+      fi
+      echo off > "$HDMI_POWER_NODE" || true
+      sleep 2
+      echo on > "$HDMI_POWER_NODE" || true
+      sleep 2
+    fi
+  done
+
+  return 1
+}
+
+apply_file() {
+  local file="$1"
+  local do_retrain="${2:-yes}"
+  local verify_rc=0
+  validate_edid "$file"
+
+  local ts backup
+  ts="$(date +%Y%m%d-%H%M%S)"
+  backup="$BACKUP_DIR/edid-backup-$ts.bin"
+  if cat "$EDID_NODE" > "$backup"; then
+    log_ok "Backup saved: $backup"
+  else
+    log_warn "Backup failed: $backup"
+  fi
+
+  if ! write_edid_with_retries "$file"; then
+    log_err "Failed to apply EDID after retries: $file"
+    print_status
+    return 1
+  fi
+
+  if ! verify_edid "$file"; then
+    verify_rc=$?
+    case "$verify_rc" in
+      2) log_warn "EDID readback unavailable, continuing." ;;
+      3) log_warn "EDID readback differs on this firmware, continuing." ;;
+      *) log_warn "EDID verify skipped, continuing." ;;
+    esac
+  fi
+
+  log_ok "Applied: $file"
+
+  if [[ "$do_retrain" == "yes" ]]; then
+    retrain
+  fi
+  print_status
+}
+
+main() {
+  setup_colors
+
+  local cmd="${1:-}"
+  cmd="${cmd%$'\r'}"
+  if [[ -z "$cmd" ]]; then
+    if [[ -t 0 && -t 1 ]]; then
+      cmd="menu"
+    else
+      usage
+      exit 0
+    fi
+  fi
+
+  if [[ "$cmd" == "-h" || "$cmd" == "--help" ]]; then
+    usage
+    exit 0
+  fi
+
+  require_root
+  require_nodes
+
+  case "$cmd" in
+    list)
+      list_presets
+      ;;
+    status)
+      print_status
+      ;;
+    menu)
+      if [[ ! -t 0 || ! -t 1 ]]; then
+        log_err "Interactive menu requires a terminal (TTY)."
+        exit 1
+      fi
+      menu_loop
+      ;;
+    retrain)
+      retrain
+      print_status
+      ;;
+    build)
+      build_custom_profile
+      ;;
+    about)
+      print_about
+      ;;
+    restore)
+      apply_file "$BUILTIN_DIR/E56-2K60FPS.bin" "yes"
+      ;;
+    apply)
+      local arg="${2:-}"
+      arg="${arg%$'\r'}"
+      local retrain_flag="yes"
+      if [[ -z "$arg" ]]; then
+        log_err "Missing preset or file path."
+        usage
+        exit 1
+      fi
+      if [[ "${3:-}" == "--no-retrain" || "${2:-}" == "--no-retrain" ]]; then
+        retrain_flag="no"
+      fi
+      local file
+      file="$(preset_to_file "$arg")"
+      if [[ -z "$file" ]]; then
+        file="$arg"
+      fi
+      apply_file "$file" "$retrain_flag"
+      ;;
+    *)
+      log_err "Unknown command: $cmd"
+      usage
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"
